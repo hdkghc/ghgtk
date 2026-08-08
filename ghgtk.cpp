@@ -93,6 +93,7 @@ GtkWidget *releaseList;
 GtkWidget *assetList;
 GtkWidget *statusBar;
 GtkWidget *bodyWebView;
+GtkWidget *readmeWebView;
 GtkWidget *debugView;
 GtkWidget *progressDialog;
 GtkWidget *progressBar;
@@ -108,18 +109,75 @@ GtkListStore *releaseStore;
 GtkListStore *assetStore;
 GtkTextBuffer *debugBuffer = nullptr;
 
-// ============ Safe String ============
+// ============ Safe String - 严格 UTF-8 验证 ============
 
 string safe(const string& s) {
     string r;
     r.reserve(s.size());
-    for (unsigned char c : s) {
+    
+    size_t i = 0;
+    while (i < s.size()) {
+        unsigned char c = s[i];
+        
+        // ASCII 可打印字符 (32-126) 直接保留
         if (c >= 32 && c <= 126) {
             r.push_back((char)c);
-        } else if (c == '\n' || c == '\r') {
+            i++;
+            continue;
+        }
+        // 换行/回车保留
+        else if (c == '\n' || c == '\r') {
             r.push_back('\n');
+            i++;
+            continue;
+        }
+        // 制表符保留
+        else if (c == '\t') {
+            r.push_back('\t');
+            i++;
+            continue;
+        }
+        // UTF-8 多字节字符 - 验证合法性
+        else if (c >= 128) {
+            int len = 0;
+            if ((c & 0xE0) == 0xC0) len = 2;       // 2字节 UTF-8
+            else if ((c & 0xF0) == 0xE0) len = 3;  // 3字节 UTF-8 (中文)
+            else if ((c & 0xF8) == 0xF0) len = 4;  // 4字节 UTF-8 (emoji)
+            else {
+                // 非法 UTF-8 起始字节，跳过
+                i++;
+                continue;
+            }
+            
+            // 检查是否有足够的字节
+            if (i + len > s.size()) {
+                i++;
+                continue;
+            }
+            
+            // 检查后续字节是否合法 (10xxxxxx)
+            bool valid = true;
+            for (int j = 1; j < len; j++) {
+                if ((s[i+j] & 0xC0) != 0x80) {
+                    valid = false;
+                    break;
+                }
+            }
+            
+            if (valid) {
+                // 保留整个 UTF-8 序列
+                r.append(s.substr(i, len));
+            }
+            i += len;
+            continue;
+        }
+        // 其他控制字符 (0-31) -> 空格
+        else {
+            r.push_back(' ');
+            i++;
         }
     }
+    
     return r;
 }
 
@@ -202,22 +260,20 @@ void set_status(const string& msg) {
         s.c_str());
 }
 
-// ===== 修复 show_debug：使用 g_idle_add 确保主线程执行 =====
-
 void show_debug(const string& msg) {
     if (!debugBuffer) return;
-    
+
     g_idle_add([](gpointer data) -> gboolean {
         string* msg_ptr = static_cast<string*>(data);
         GtkTextIter iter;
         gtk_text_buffer_get_end_iter(debugBuffer, &iter);
         gtk_text_buffer_insert(debugBuffer, &iter, msg_ptr->c_str(), -1);
         gtk_text_buffer_insert(debugBuffer, &iter, "\n", -1);
-        
+
         GtkTextMark *mark = gtk_text_buffer_create_mark(debugBuffer, "end", &iter, false);
         gtk_text_view_scroll_to_mark(GTK_TEXT_VIEW(debugView), mark, 0, false, 0, 0);
         gtk_text_buffer_delete_mark(debugBuffer, mark);
-        
+
         delete msg_ptr;
         return G_SOURCE_REMOVE;
     }, new string(safe(msg)));
@@ -376,19 +432,320 @@ void set_working(bool working) {
     }
 }
 
-// ============ Markdown Rendering ============
+// ============ Markdown Rendering (表格支持，用 <div> 占位，启用 UNSAFE) ============
+
+// 检测是否是合法的表格分隔行
+static bool is_valid_separator(const string& line) {
+    size_t s = line.find_first_not_of(" \t");
+    if (s == string::npos) return false;
+    size_t e = line.find_last_not_of(" \t");
+    string trimmed = line.substr(s, e - s + 1);
+
+    if (trimmed.front() != '|' || trimmed.back() != '|') {
+        return false;
+    }
+
+    string inner = trimmed.substr(1, trimmed.length() - 2);
+    vector<string> cells;
+    string cell;
+    for (char c : inner) {
+        if (c == '|') {
+            cells.push_back(cell);
+            cell = "";
+        } else {
+            cell += c;
+        }
+    }
+    if (!cell.empty() || !cells.empty()) {
+        cells.push_back(cell);
+    }
+
+    if (cells.empty()) return false;
+
+    for (auto& c : cells) {
+        size_t cs = c.find_first_not_of(" \t");
+        if (cs == string::npos) return false;
+        size_t ce = c.find_last_not_of(" \t");
+        string cell_trimmed = c.substr(cs, ce - cs + 1);
+
+        bool has_dash = false;
+        for (char ch : cell_trimmed) {
+            if (ch == '-') {
+                has_dash = true;
+            } else if (ch == ':') {
+                // 允许冒号
+            } else if (ch != ' ') {
+                return false;
+            }
+        }
+        if (!has_dash) return false;
+
+        string no_space;
+        for (char ch : cell_trimmed) {
+            if (ch != ' ') no_space += ch;
+        }
+        for (size_t i = 1; i < no_space.length() - 1; i++) {
+            if (no_space[i] == ':') return false;
+        }
+        int colon_count = 0;
+        for (char ch : no_space) {
+            if (ch == ':') colon_count++;
+        }
+        if (colon_count > 2) return false;
+    }
+
+    return true;
+}
+
+static bool is_table_row(const string& line) {
+    size_t s = line.find_first_not_of(" \t");
+    if (s == string::npos) return false;
+    size_t e = line.find_last_not_of(" \t");
+    string trimmed = line.substr(s, e - s + 1);
+    if (trimmed.front() != '|' || trimmed.back() != '|') return false;
+    if (is_valid_separator(line)) return false;
+    return true;
+}
+
+static vector<string> parse_table_row(const string& line) {
+    vector<string> cells;
+    size_t s = line.find_first_not_of(" \t");
+    if (s == string::npos) return cells;
+    size_t e = line.find_last_not_of(" \t");
+    string trimmed = line.substr(s, e - s + 1);
+    
+    if (trimmed.front() != '|' || trimmed.back() != '|') {
+        return cells;
+    }
+
+    string inner = trimmed.substr(1, trimmed.length() - 2);
+    string cell;
+    for (char c : inner) {
+        if (c == '|') {
+            cells.push_back(cell);
+            cell = "";
+        } else {
+            cell += c;
+        }
+    }
+    if (!cell.empty() || !cells.empty()) {
+        cells.push_back(cell);
+    }
+    for (auto& c : cells) {
+        size_t cs = c.find_first_not_of(" \t");
+        if (cs == string::npos) { c = ""; continue; }
+        size_t ce = c.find_last_not_of(" \t");
+        c = c.substr(cs, ce - cs + 1);
+    }
+    return cells;
+}
+
+static string render_table_from_lines(const vector<string>& table_lines) {
+    vector<vector<string>> rows;
+    for (auto& tl : table_lines) {
+        if (is_valid_separator(tl)) continue;
+        vector<string> cells = parse_table_row(tl);
+        if (!cells.empty()) {
+            rows.push_back(cells);
+        }
+    }
+
+    if (rows.size() < 2) return "";
+
+    size_t max_cols = 0;
+    for (auto& row : rows) {
+        if (row.size() > max_cols) max_cols = row.size();
+    }
+    for (auto& row : rows) {
+        while (row.size() < max_cols) row.push_back("");
+    }
+
+    string table = "<table>\n";
+    table += "  <thead>\n    <tr>\n";
+    for (auto& cell : rows[0]) {
+        char* cell_html = cmark_markdown_to_html(cell.c_str(), cell.size(), CMARK_OPT_DEFAULT);
+        string cell_content = cell_html ? string(cell_html) : cell;
+        if (cell_html) free(cell_html);
+        table += "      <th>" + cell_content + "</th>\n";
+    }
+    table += "    </tr>\n  </thead>\n";
+
+    table += "  <tbody>\n";
+    for (size_t i = 1; i < rows.size(); i++) {
+        table += "    <tr>\n";
+        for (auto& cell : rows[i]) {
+            char* cell_html = cmark_markdown_to_html(cell.c_str(), cell.size(), CMARK_OPT_DEFAULT);
+            string cell_content = cell_html ? string(cell_html) : cell;
+            if (cell_html) free(cell_html);
+            table += "      <td>" + cell_content + "</td>\n";
+        }
+        table += "    </tr>\n";
+    }
+    table += "  </tbody>\n";
+    table += "</table>\n";
+
+    return table;
+}
+
+struct TableBlock {
+    int start_line;
+    int end_line;
+    string placeholder;
+    string html;
+};
+
+static vector<TableBlock> find_table_blocks(const vector<string>& lines) {
+    vector<TableBlock> blocks;
+    size_t i = 0;
+    int block_id = 0;
+    while (i < lines.size()) {
+        if (is_valid_separator(lines[i])) {
+            int start = i;
+            int header_line = -1;
+            for (int j = i - 1; j >= 0; j--) {
+                if (is_table_row(lines[j])) {
+                    header_line = j;
+                    break;
+                }
+                string trimmed = lines[j];
+                size_t s = trimmed.find_first_not_of(" \t");
+                if (s != string::npos) break;
+            }
+            if (header_line != -1) {
+                start = header_line;
+            }
+
+            int end = i;
+            for (size_t j = i + 1; j < lines.size(); j++) {
+                if (is_table_row(lines[j])) {
+                    end = j;
+                } else {
+                    break;
+                }
+            }
+
+            vector<string> table_lines;
+            for (int j = start; j <= end; j++) {
+                table_lines.push_back(lines[j]);
+            }
+
+            string html = render_table_from_lines(table_lines);
+            if (!html.empty()) {
+                TableBlock block;
+                block.start_line = start;
+                block.end_line = end;
+                block.placeholder = "<div id=\"table_" + to_string(block_id) + "\"></div>";
+                block.html = html;
+                blocks.push_back(block);
+                block_id++;
+            }
+
+            i = end + 1;
+            continue;
+        }
+        i++;
+    }
+    return blocks;
+}
 
 string render_markdown_html(const string& body) {
     string safe_body = safe(body);
     if (safe_body.empty()) {
-        return "<p><em>No release notes</em></p>";
+        return "<p><em>No content</em></p>";
     }
 
+    // 1. 先用 cmark 渲染整个文档
     char* html = cmark_markdown_to_html(safe_body.c_str(), safe_body.size(), CMARK_OPT_DEFAULT);
     string result = html ? string(html) : "";
     if (html) free(html);
 
-    return result;
+    // 2. 检查是否有表格
+    vector<string> lines;
+    stringstream ss(safe_body);
+    string line;
+    while (getline(ss, line)) {
+        lines.push_back(line);
+    }
+
+    vector<TableBlock> blocks = find_table_blocks(lines);
+    if (blocks.empty()) {
+        return result;
+    }
+
+    // 3. 用 <div> 占位符替换原始表格
+    string processed_body;
+    int block_idx = 0;
+    for (size_t i = 0; i < lines.size(); i++) {
+        bool in_block = false;
+        if (block_idx < (int)blocks.size()) {
+            if (i >= (size_t)blocks[block_idx].start_line && i <= (size_t)blocks[block_idx].end_line) {
+                if (i == (size_t)blocks[block_idx].start_line) {
+                    processed_body += blocks[block_idx].placeholder + "\n";
+                }
+                in_block = true;
+                if (i == (size_t)blocks[block_idx].end_line) {
+                    block_idx++;
+                }
+            }
+        }
+        if (!in_block) {
+            processed_body += lines[i] + "\n";
+        }
+    }
+
+    // 4. 渲染带占位符的 Markdown
+    // 关键: 使用 CMARK_OPT_UNSAFE 让 cmark 保留 HTML 标签
+    char* html2 = cmark_markdown_to_html(processed_body.c_str(), processed_body.size(), CMARK_OPT_UNSAFE);
+    string result2 = html2 ? string(html2) : "";
+    if (html2) free(html2);
+
+    // 5. 替换 <div> 占位符为表格 HTML
+    for (auto& block : blocks) {
+        size_t pos = result2.find(block.placeholder);
+        if (pos != string::npos) {
+            result2.replace(pos, block.placeholder.length(), block.html);
+        }
+    }
+
+    return result2;
+}
+
+void render_markdown_to_webview(GtkWidget* webView, const string& body, const string& default_msg) {
+    if (!webView) return;
+
+    string html_content = render_markdown_html(body);
+
+    string full_html =
+        "<!DOCTYPE html>\n"
+        "<html>\n"
+        "<head><meta charset=\"UTF-8\"><style>\n"
+        "body { font-family: 'Ubuntu Sans Mono', 'Cascadia Mono', 'Consolas', monospace; font-size: 14px; line-height: 1.6; margin: 15px; padding: 0; color: #24292e; background: #ffffff; overflow-wrap: break-word; }\n"
+        "h1 { font-size: 2em; border-bottom: 2px solid #eaecef; padding-bottom: 0.3em; }\n"
+        "h2 { font-size: 1.5em; border-bottom: 1px solid #eaecef; padding-bottom: 0.3em; }\n"
+        "h3 { font-size: 1.25em; }\n"
+        "h4 { font-size: 1.1em; }\n"
+        "h5 { font-size: 1.0em; }\n"
+        "h6 { font-size: 0.9em; }\n"
+        "p { margin: 0.5em 0; }\n"
+        "pre { background: #f6f8fa; padding: 12px; border-radius: 6px; overflow: auto; border: 1px solid #e1e4e8; font-family: 'Cascadia Mono', 'Ubuntu Sans Mono', monospace; font-size: 13px; white-space: pre-wrap; word-break: break-all; }\n"
+        "code { background: #f6f8fa; padding: 2px 6px; border-radius: 3px; font-family: 'Cascadia Mono', 'Ubuntu Sans Mono', monospace; font-size: 0.9em; }\n"
+        "pre code { background: transparent; padding: 0; border-radius: 0; font-size: inherit; }\n"
+        "ul, ol { padding-left: 25px; margin: 0.3em 0; }\n"
+        "li { margin: 2px 0; }\n"
+        "li > ul, li > ol { margin: 0; padding-left: 20px; }\n"
+        "blockquote { border-left: 4px solid #dfe2e5; padding-left: 16px; color: #6a737d; margin: 10px 0; background: #f8f9fa; padding: 8px 16px; }\n"
+        "a { color: #0366d6; text-decoration: underline; cursor: pointer; }\n"
+        "a:hover { color: #0056b3; }\n"
+        "img { max-width: 100%; }\n"
+        "table { border-collapse: collapse; width: 100%; margin: 10px 0; }\n"
+        "th, td { border: 1px solid #dfe2e5; padding: 6px 13px; }\n"
+        "th { background: #f6f8fa; }\n"
+        "hr { border: 0; border-top: 1px solid #eaecef; margin: 15px 0; }\n"
+        "</style></head>\n"
+        "<body>" + html_content + "</body>\n"
+        "</html>";
+
+    webkit_web_view_load_html(WEBKIT_WEB_VIEW(webView), full_html.c_str(), NULL);
 }
 
 static void on_mouse_target_changed(WebKitWebView *web_view,
@@ -404,119 +761,40 @@ static void on_mouse_target_changed(WebKitWebView *web_view,
     set_status("Ready");
 }
 
-void render_markdown(const string& body) {
-    if (!bodyWebView) return;
+// ============ Fetch README ============
 
-    string html_content = render_markdown_html(body);
+string fetch_readme(const string& owner, const string& repo) {
+    string cmd = "gh api repos/" + owner + "/" + repo + "/readme 2>&1";
+    string output = exec_cmd(cmd);
+    if (output.empty()) return "";
 
-    string full_html = R"(
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <style>
-        body {
-            font-family: 'Ubuntu Sans Mono', 'Cascadia Mono', 'Consolas', monospace;
-            font-size: 14px;
-            line-height: 1.6;
-            margin: 15px;
-            padding: 0;
-            color: #24292e;
-            background: #ffffff;
-            overflow-wrap: break-word;
-            word-wrap: break-word;
-        }
-        h1 { font-size: 2em; border-bottom: 2px solid #eaecef; padding-bottom: 0.3em; margin: 0.5em 0; }
-        h2 { font-size: 1.5em; border-bottom: 1px solid #eaecef; padding-bottom: 0.3em; margin: 0.5em 0; }
-        h3 { font-size: 1.25em; margin: 0.5em 0; }
-        h4 { font-size: 1.1em; margin: 0.5em 0; }
-        h5 { font-size: 1.0em; margin: 0.5em 0; }
-        h6 { font-size: 0.9em; margin: 0.5em 0; }
-        p { margin: 0.5em 0; }
-        pre {
-            background: #f6f8fa;
-            padding: 12px;
-            border-radius: 6px;
-            overflow: auto;
-            border: 1px solid #e1e4e8;
-            font-family: 'Cascadia Mono', 'Ubuntu Sans Mono', 'Consolas', monospace;
-            font-size: 13px;
-            white-space: pre-wrap;
-            word-break: break-all;
-        }
-        code {
-            background: #f6f8fa;
-            padding: 2px 6px;
-            border-radius: 3px;
-            font-family: 'Cascadia Mono', 'Ubuntu Sans Mono', 'Consolas', monospace;
-            font-size: 0.9em;
-        }
-        pre code {
-            background: transparent;
-            padding: 0;
-            border-radius: 0;
-            font-size: inherit;
-            font-family: 'Cascadia Mono', 'Ubuntu Sans Mono', 'Consolas', monospace;
-        }
-        ul, ol {
-            padding-left: 25px;
-            margin: 0.3em 0;
-        }
-        li {
-            margin: 2px 0;
-        }
-        li > ul, li > ol {
-            margin: 0;
-            padding-left: 20px;
-        }
-        blockquote {
-            border-left: 4px solid #dfe2e5;
-            padding-left: 16px;
-            color: #6a737d;
-            margin: 10px 0;
-            background: #f8f9fa;
-            padding: 8px 16px;
-        }
-        a {
-            color: #0366d6;
-            text-decoration: underline;
-            cursor: pointer;
-        }
-        a:hover {
-            color: #0056b3;
-        }
-        table {
-            border-collapse: collapse;
-            width: 100%;
-            margin: 10px 0;
-        }
-        th, td {
-            border: 1px solid #dfe2e5;
-            padding: 6px 13px;
-        }
-        th {
-            background: #f6f8fa;
-        }
-        img {
-            max-width: 100%;
-        }
-        hr {
-            border: 0;
-            border-top: 1px solid #eaecef;
-            margin: 15px 0;
-        }
-        .highlight {
-            background: #f6f8fa;
-        }
-    </style>
-</head>
-<body>
-    )" + html_content + R"(
-</body>
-</html>
-)";
+    if (output.find("Not Found") != string::npos ||
+        output.find("404") != string::npos ||
+        output.find("No such") != string::npos) {
+        return "";
+    }
 
-    webkit_web_view_load_html(WEBKIT_WEB_VIEW(bodyWebView), full_html.c_str(), NULL);
+    json_object* root = json_tokener_parse(output.c_str());
+    if (!root) return "";
+
+    string content = "";
+    json_object* contentObj;
+    if (json_object_object_get_ex(root, "content", &contentObj)) {
+        const char* v = json_object_get_string(contentObj);
+        if (v) {
+            string encoded = v;
+            encoded.erase(remove(encoded.begin(), encoded.end(), '\n'), encoded.end());
+            encoded.erase(remove(encoded.begin(), encoded.end(), '\r'), encoded.end());
+            string cmd2 = "echo '" + encoded + "' | base64 -d 2>/dev/null";
+            content = exec_cmd(cmd2);
+            if (content.empty()) {
+                string cmd3 = "printf '%s' '" + encoded + "' | base64 -d 2>/dev/null";
+                content = exec_cmd(cmd3);
+            }
+        }
+    }
+    json_object_put(root);
+    return content;
 }
 
 // ============ GitHub API ============
@@ -715,7 +993,7 @@ void do_download_async(const string& owner, const string& repo, const string& ta
 
     thread([owner, repo, tag, assets, total_files, total_bytes,
             create_folder, base_path]() {
-        chdir(base_path.c_str());
+        (void)chdir(base_path.c_str());
 
         string target_dir = "";
         if (create_folder) {
@@ -732,7 +1010,6 @@ void do_download_async(const string& owner, const string& repo, const string& ta
             string filepath = target_dir.empty() ? filename : target_dir + "/" + filename;
             int64_t total_size = assets[i].size_bytes;
 
-            // Skip if file already exists and has correct size
             if (file_exists(filepath) && file_size(filepath) >= total_size) {
                 show_debug("Skipping existing: " + filename);
                 downloaded_files++;
@@ -766,13 +1043,11 @@ void do_download_async(const string& owner, const string& repo, const string& ta
                 bool file_created = false;
                 int64_t last_size = 0;
 
-                // For speed calculation, initialize last_sample_bytes to existing file size
                 int64_t initial_size = file_exists(filepath) ? file_size(filepath) : 0;
                 if (initial_size > 0) {
                     last_sample_bytes = initial_size;
                 }
 
-                // Monitor this file's download progress
                 while (!shouldStop) {
                     if (file_exists(filepath)) {
                         int64_t current_size = file_size(filepath);
@@ -781,7 +1056,6 @@ void do_download_async(const string& owner, const string& repo, const string& ta
                             double single_progress = (total_size > 0) ?
                                 min(current_size / (double)total_size, 0.999) : 0.0;
 
-                            // Calculate speed
                             auto now = chrono::steady_clock::now();
                             double elapsed = chrono::duration<double>(now - last_sample_time).count();
                             if (elapsed >= 0.5) {
@@ -825,7 +1099,6 @@ void do_download_async(const string& owner, const string& repo, const string& ta
                         }
                     }
 
-                    // Check if gh process finished
                     int status;
                     pid_t result = waitpid(pid, &status, WNOHANG);
                     if (result == pid) {
@@ -845,7 +1118,6 @@ void do_download_async(const string& owner, const string& repo, const string& ta
                 waitpid(pid, NULL, 0);
                 if (gh_pid == pid) gh_pid = 0;
             } else {
-                // fork failed
                 show_debug("Fork failed for: " + filename);
                 continue;
             }
@@ -864,7 +1136,6 @@ void do_download_async(const string& owner, const string& repo, const string& ta
             );
         }
 
-        // Final update
         show_double_progress(
             "Files: " + to_string(total_files) + "/" + to_string(total_files),
             1.0,
@@ -967,6 +1238,45 @@ void on_search(GtkWidget*, gpointer) {
     do_search_async(q);
 }
 
+// ============ Callback: README load (g_idle_add compatible) ============
+
+static gboolean on_readme_load(gpointer data) {
+    string* readme = static_cast<string*>(data);
+    if (!readme->empty()) {
+        render_markdown_to_webview(readmeWebView, *readme, "");
+    } else {
+        webkit_web_view_load_html(WEBKIT_WEB_VIEW(readmeWebView),
+            "<p style='font-family: monospace; margin: 15px; color: #666;'>No README found</p>", NULL);
+    }
+    delete readme;
+    return G_SOURCE_REMOVE;
+}
+
+// ============ Callback: repo selected in search ============
+
+void on_repo_selected_in_search(GtkTreeSelection* selection, gpointer data) {
+    GtkTreeIter iter;
+    GtkTreeModel* model;
+    if (!gtk_tree_selection_get_selected(selection, &model, &iter)) return;
+
+    char* display;
+    gtk_tree_model_get(model, &iter, 0, &display, -1);
+    if (!display) return;
+    string full = display;
+    g_free(display);
+    size_t slash = full.find('/');
+    if (slash == string::npos) return;
+
+    string owner = full.substr(0, slash);
+    string repo = full.substr(slash + 1);
+
+    thread([owner, repo]() {
+        string readme = fetch_readme(owner, repo);
+        string* readme_ptr = new string(readme);
+        g_idle_add((GSourceFunc)on_readme_load, readme_ptr);
+    }).detach();
+}
+
 void on_repo_activate(GtkTreeView* view, GtkTreePath* path, GtkTreeViewColumn*, gpointer) {
     if (isWorking) return;
     GtkTreeIter it;
@@ -1007,7 +1317,7 @@ void on_release_select(GtkTreeSelection* sel, gpointer) {
         gtk_list_store_set(assetStore, &it2, 0, display.c_str(), -1);
     }
 
-    render_markdown(releases[idx].body);
+    render_markdown_to_webview(bodyWebView, releases[idx].body, "Select a release to see notes");
 }
 
 void on_download(GtkWidget*, gpointer) {
@@ -1101,7 +1411,7 @@ void on_clone(GtkWidget*, gpointer) {
         "_Select", GTK_RESPONSE_ACCEPT, NULL);
     if (gtk_dialog_run(GTK_DIALOG(fc)) == GTK_RESPONSE_ACCEPT) {
         char* path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(fc));
-        if (path) { chdir(path); g_free(path); }
+        if (path) { (void)chdir(path); g_free(path); }
         do_clone_async(currentOwner + "/" + currentRepo);
     }
     gtk_widget_destroy(fc);
@@ -1151,6 +1461,7 @@ int main(int argc, char* argv[]) {
     // ===== Tab 0: Search =====
     GtkWidget* searchPage = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
     gtk_container_set_border_width(GTK_CONTAINER(searchPage), 10);
+
     GtkWidget* hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
     gtk_box_pack_start(GTK_BOX(hbox), gtk_label_new("Search:"), false, false, 0);
     searchEntry = gtk_entry_new();
@@ -1162,9 +1473,14 @@ int main(int argc, char* argv[]) {
     gtk_box_pack_start(GTK_BOX(hbox), searchBtn, false, false, 0);
     gtk_box_pack_start(GTK_BOX(searchPage), hbox, false, false, 0);
 
+    GtkWidget* searchPaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_box_pack_start(GTK_BOX(searchPage), searchPaned, true, true, 0);
+
+    // 左侧：仓库列表
+    GtkWidget* searchLeftBox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
     GtkWidget* scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-    gtk_box_pack_start(GTK_BOX(searchPage), scroll, true, true, 0);
+    gtk_box_pack_start(GTK_BOX(searchLeftBox), scroll, true, true, 0);
 
     repoStore = gtk_list_store_new(3, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
     repoList = gtk_tree_view_new_with_model(GTK_TREE_MODEL(repoStore));
@@ -1179,8 +1495,29 @@ int main(int argc, char* argv[]) {
     gtk_tree_view_column_set_fixed_width(col, 80);
     gtk_tree_view_append_column(GTK_TREE_VIEW(repoList), col);
 
+    GtkTreeSelection* repoSelection = gtk_tree_view_get_selection(GTK_TREE_VIEW(repoList));
+    g_signal_connect(repoSelection, "changed", G_CALLBACK(on_repo_selected_in_search), NULL);
     g_signal_connect(repoList, "row-activated", G_CALLBACK(on_repo_activate), NULL);
+
     gtk_container_add(GTK_CONTAINER(scroll), repoList);
+    gtk_paned_pack1(GTK_PANED(searchPaned), searchLeftBox, true, false);
+
+    // 右侧：README 预览
+    GtkWidget* searchRightBox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    GtkWidget* readmeFrame = gtk_frame_new("README Preview");
+    gtk_box_pack_start(GTK_BOX(searchRightBox), readmeFrame, true, true, 0);
+    GtkWidget* readmeBox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_container_add(GTK_CONTAINER(readmeFrame), readmeBox);
+    GtkWidget* readmeScroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(readmeScroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_box_pack_start(GTK_BOX(readmeBox), readmeScroll, true, true, 0);
+    readmeWebView = webkit_web_view_new();
+    g_signal_connect(readmeWebView, "mouse-target-changed", G_CALLBACK(on_mouse_target_changed), NULL);
+    webkit_web_view_load_html(WEBKIT_WEB_VIEW(readmeWebView),
+        "<p style='font-family: monospace; margin: 15px; color: #666;'>Select a repository to preview README</p>", NULL);
+    gtk_container_add(GTK_CONTAINER(readmeScroll), readmeWebView);
+    gtk_paned_pack2(GTK_PANED(searchPaned), searchRightBox, true, false);
+
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), searchPage, gtk_label_new("Search"));
 
     // ===== Tab 1: Releases =====
@@ -1203,10 +1540,12 @@ int main(int argc, char* argv[]) {
     gtk_widget_set_size_request(hpaned, -1, 500);
     gtk_box_pack_start(GTK_BOX(releasePage), hpaned, true, true, 0);
 
-    GtkWidget* leftBox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    // 左侧 Releases 列表
+    GtkWidget* releaseLeftBox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
     GtkWidget* scrollR = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrollR), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-    gtk_box_pack_start(GTK_BOX(leftBox), scrollR, true, true, 0);
+    gtk_box_pack_start(GTK_BOX(releaseLeftBox), scrollR, true, true, 0);
+
     releaseStore = gtk_list_store_new(3, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
     releaseList = gtk_tree_view_new_with_model(GTK_TREE_MODEL(releaseStore));
     rend = gtk_cell_renderer_text_new();
@@ -1219,15 +1558,17 @@ int main(int argc, char* argv[]) {
     col = gtk_tree_view_column_new_with_attributes("Assets", rend, "text", 2, NULL);
     gtk_tree_view_column_set_expand(col, true);
     gtk_tree_view_append_column(GTK_TREE_VIEW(releaseList), col);
+
     GtkTreeSelection* sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(releaseList));
     g_signal_connect(sel, "changed", G_CALLBACK(on_release_select), NULL);
     gtk_container_add(GTK_CONTAINER(scrollR), releaseList);
-    gtk_paned_pack1(GTK_PANED(hpaned), leftBox, true, false);
+    gtk_paned_pack1(GTK_PANED(hpaned), releaseLeftBox, true, false);
 
-    GtkWidget* rightBox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    // 右侧 Assets + Release Notes
+    GtkWidget* releaseRightBox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
 
     GtkWidget* assetFrame = gtk_frame_new("Assets");
-    gtk_box_pack_start(GTK_BOX(rightBox), assetFrame, false, true, 0);
+    gtk_box_pack_start(GTK_BOX(releaseRightBox), assetFrame, false, true, 0);
     GtkWidget* assetBox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
     gtk_container_add(GTK_CONTAINER(assetFrame), assetBox);
     GtkWidget* scrollA = gtk_scrolled_window_new(NULL, NULL);
@@ -1243,20 +1584,19 @@ int main(int argc, char* argv[]) {
     gtk_container_add(GTK_CONTAINER(scrollA), assetList);
 
     GtkWidget* bodyFrame = gtk_frame_new("Release Notes");
-    gtk_box_pack_start(GTK_BOX(rightBox), bodyFrame, true, true, 0);
+    gtk_box_pack_start(GTK_BOX(releaseRightBox), bodyFrame, true, true, 0);
     GtkWidget* bodyBox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
     gtk_container_add(GTK_CONTAINER(bodyFrame), bodyBox);
     GtkWidget* scrollB = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrollB), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
     gtk_box_pack_start(GTK_BOX(bodyBox), scrollB, true, true, 0);
     bodyWebView = webkit_web_view_new();
-    g_signal_connect(bodyWebView, "mouse-target-changed",
-                     G_CALLBACK(on_mouse_target_changed), NULL);
+    g_signal_connect(bodyWebView, "mouse-target-changed", G_CALLBACK(on_mouse_target_changed), NULL);
     webkit_web_view_load_html(WEBKIT_WEB_VIEW(bodyWebView),
-                              "<p style='font-family: monospace; margin: 15px;'>Select a release</p>", NULL);
+        "<p style='font-family: monospace; margin: 15px; color: #666;'>Select a release to see notes</p>", NULL);
     gtk_container_add(GTK_CONTAINER(scrollB), bodyWebView);
 
-    gtk_paned_pack2(GTK_PANED(hpaned), rightBox, true, false);
+    gtk_paned_pack2(GTK_PANED(hpaned), releaseRightBox, true, false);
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), releasePage, gtk_label_new("Releases"));
 
     // ===== Tab 2: Debug =====
@@ -1277,7 +1617,7 @@ int main(int argc, char* argv[]) {
 
     statusBar = gtk_statusbar_new();
     gtk_box_pack_start(GTK_BOX(vbox), statusBar, false, false, 0);
-    set_status("Ready. Double-click repo.");
+    set_status("Ready. Click a repo to preview README, double-click to see releases.");
 
     progressDialog = nullptr;
     progressBar = nullptr;
