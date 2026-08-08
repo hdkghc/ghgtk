@@ -38,6 +38,13 @@
 #include <functional>
 #include <mutex>
 #include <sstream>
+#include <iomanip>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
 
 using namespace std;
 
@@ -45,6 +52,8 @@ using namespace std;
 
 struct Asset {
     string name;
+    string size;
+    int64_t size_bytes;
 };
 
 struct Release {
@@ -52,6 +61,7 @@ struct Release {
     string published;
     string body;
     vector<Asset> assets;
+    int64_t total_size_bytes;
 };
 
 struct Repo {
@@ -68,7 +78,13 @@ vector<Release> releases;
 string currentOwner, currentRepo;
 atomic<bool> isWorking{false};
 atomic<bool> shouldStop{false};
+atomic<int64_t> downloaded_bytes{0};
+atomic<int> downloaded_files{0};
+atomic<pid_t> gh_pid{0};
+atomic<double> current_speed{0.0};
+atomic<double> current_eta{0.0};
 mutex releasesMutex;
+mutex speed_mutex;
 
 GtkWidget *window;
 GtkWidget *searchEntry;
@@ -80,7 +96,10 @@ GtkWidget *bodyWebView;
 GtkWidget *debugView;
 GtkWidget *progressDialog;
 GtkWidget *progressBar;
+GtkWidget *progressBar2;
 GtkWidget *progressLabel;
+GtkWidget *progressLabel2;
+GtkWidget *speedLabel;
 GtkWidget *spinner;
 GtkWidget *notebook;
 
@@ -118,6 +137,64 @@ string exec_cmd(const string& cmd) {
     return result;
 }
 
+string format_size(int64_t bytes) {
+    if (bytes < 0) return "N/A";
+    if (bytes < 1024) return to_string(bytes) + " B";
+    if (bytes < 1024 * 1024) {
+        double kb = bytes / 1024.0;
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%.1f KB", kb);
+        return string(buf);
+    }
+    if (bytes < 1024 * 1024 * 1024) {
+        double mb = bytes / (1024.0 * 1024.0);
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%.1f MB", mb);
+        return string(buf);
+    }
+    double gb = bytes / (1024.0 * 1024.0 * 1024.0);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%.2f GB", gb);
+    return string(buf);
+}
+
+string format_speed(double kb_s) {
+    if (kb_s < 0) return "N/A";
+    if (kb_s < 1.0) {
+        double b_s = kb_s * 1024;
+        return to_string((int)b_s) + " B/s";
+    }
+    if (kb_s < 1024) {
+        return to_string((int)kb_s) + " KB/s";
+    }
+    double mb_s = kb_s / 1024.0;
+    if (mb_s < 1024) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%.1f MB/s", mb_s);
+        return string(buf);
+    }
+    double gb_s = mb_s / 1024.0;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%.2f GB/s", gb_s);
+    return string(buf);
+}
+
+string format_eta(double seconds) {
+    if (seconds < 0 || seconds > 86400) return "> 24h";
+    if (seconds < 60) return to_string((int)seconds) + "s";
+    if (seconds < 3600) {
+        int mins = (int)(seconds / 60);
+        int secs = (int)(seconds) % 60;
+        return to_string(mins) + "m " + to_string(secs) + "s";
+    }
+    if (seconds < 86400) {
+        int hours = (int)(seconds / 3600);
+        int mins = (int)((seconds - hours * 3600) / 60);
+        return to_string(hours) + "h " + to_string(mins) + "m";
+    }
+    return "> 24h";
+}
+
 void set_status(const string& msg) {
     string s = safe(msg);
     gtk_statusbar_push(GTK_STATUSBAR(statusBar),
@@ -125,26 +202,86 @@ void set_status(const string& msg) {
         s.c_str());
 }
 
+// ===== 修复 show_debug：使用 g_idle_add 确保主线程执行 =====
+
 void show_debug(const string& msg) {
     if (!debugBuffer) return;
-    string s = safe(msg);
-    GtkTextIter iter;
-    gtk_text_buffer_get_end_iter(debugBuffer, &iter);
-    gtk_text_buffer_insert(debugBuffer, &iter, s.c_str(), -1);
-    gtk_text_buffer_insert(debugBuffer, &iter, "\n", -1);
-    GtkTextMark *mark = gtk_text_buffer_create_mark(debugBuffer, "end", &iter, false);
-    gtk_text_view_scroll_to_mark(GTK_TEXT_VIEW(debugView), mark, 0, false, 0, 0);
-    gtk_text_buffer_delete_mark(debugBuffer, mark);
+    
+    g_idle_add([](gpointer data) -> gboolean {
+        string* msg_ptr = static_cast<string*>(data);
+        GtkTextIter iter;
+        gtk_text_buffer_get_end_iter(debugBuffer, &iter);
+        gtk_text_buffer_insert(debugBuffer, &iter, msg_ptr->c_str(), -1);
+        gtk_text_buffer_insert(debugBuffer, &iter, "\n", -1);
+        
+        GtkTextMark *mark = gtk_text_buffer_create_mark(debugBuffer, "end", &iter, false);
+        gtk_text_view_scroll_to_mark(GTK_TEXT_VIEW(debugView), mark, 0, false, 0, 0);
+        gtk_text_buffer_delete_mark(debugBuffer, mark);
+        
+        delete msg_ptr;
+        return G_SOURCE_REMOVE;
+    }, new string(safe(msg)));
 }
 
-void show_progress(const string& label, double frac) {
+// ===== Single progress bar =====
+
+void update_single_progress(const string& label, double frac) {
     string s = safe(label);
     gtk_label_set_text(GTK_LABEL(progressLabel), s.c_str());
     gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(progressBar), frac);
-    while (gtk_events_pending()) gtk_main_iteration();
+    gtk_widget_hide(progressLabel2);
+    gtk_widget_hide(progressBar2);
+    gtk_widget_hide(speedLabel);
 }
 
-void show_progress_dialog(const string& title) {
+void show_single_progress(const string& label, double frac) {
+    g_idle_add([](gpointer data) -> gboolean {
+        auto* args = static_cast<tuple<string, double>*>(data);
+        update_single_progress(get<0>(*args), get<1>(*args));
+        delete args;
+        return G_SOURCE_REMOVE;
+    }, new tuple<string, double>(label, frac));
+}
+
+// ===== Double progress bars with speed/ETA =====
+
+void update_double_progress(const string& label1, double frac1,
+                            const string& label2, double frac2) {
+    gtk_label_set_text(GTK_LABEL(progressLabel), safe(label1).c_str());
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(progressBar), frac1);
+    gtk_widget_show(progressLabel2);
+    gtk_widget_show(progressBar2);
+    gtk_label_set_text(GTK_LABEL(progressLabel2), safe(label2).c_str());
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(progressBar2), frac2);
+
+    double speed = current_speed.load();
+    double eta = current_eta.load();
+    if (speed > 0) {
+        string info = format_speed(speed) + "  ETA: " + format_eta(eta);
+        gtk_label_set_text(GTK_LABEL(speedLabel), info.c_str());
+        gtk_widget_show(speedLabel);
+    } else if (frac2 > 0 && frac2 < 1) {
+        gtk_label_set_text(GTK_LABEL(speedLabel), "Calculating speed...");
+        gtk_widget_show(speedLabel);
+    } else {
+        gtk_widget_hide(speedLabel);
+    }
+}
+
+void show_double_progress(const string& label1, double frac1,
+                          const string& label2, double frac2) {
+    g_idle_add([](gpointer data) -> gboolean {
+        auto* args = static_cast<tuple<string, double, string, double>*>(data);
+        update_double_progress(get<0>(*args), get<1>(*args),
+                               get<2>(*args), get<3>(*args));
+        delete args;
+        return G_SOURCE_REMOVE;
+    }, new tuple<string, double, string, double>(label1, frac1, label2, frac2));
+}
+
+// ===== Progress Dialog =====
+
+void show_progress_dialog(const string& title, bool single = true) {
     if (!progressDialog) {
         progressDialog = gtk_dialog_new_with_buttons(
             safe(title).c_str(), GTK_WINDOW(window),
@@ -152,20 +289,64 @@ void show_progress_dialog(const string& title) {
             "_Cancel", GTK_RESPONSE_CANCEL, NULL);
         GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(progressDialog));
         gtk_container_set_border_width(GTK_CONTAINER(content), 10);
-        progressLabel = gtk_label_new("Working...");
-        gtk_box_pack_start(GTK_BOX(content), progressLabel, false, false, 5);
+
+        progressLabel = gtk_label_new("Starting...");
+        gtk_box_pack_start(GTK_BOX(content), progressLabel, false, false, 2);
         progressBar = gtk_progress_bar_new();
         gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(progressBar), 0.0);
-        gtk_box_pack_start(GTK_BOX(content), progressBar, false, false, 5);
+        gtk_widget_set_size_request(progressBar, 400, 20);
+        gtk_box_pack_start(GTK_BOX(content), progressBar, false, false, 2);
+
+        progressLabel2 = gtk_label_new("");
+        gtk_box_pack_start(GTK_BOX(content), progressLabel2, false, false, 2);
+        progressBar2 = gtk_progress_bar_new();
+        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(progressBar2), 0.0);
+        gtk_widget_set_size_request(progressBar2, 400, 20);
+        gtk_box_pack_start(GTK_BOX(content), progressBar2, false, false, 2);
+
+        speedLabel = gtk_label_new("");
+        gtk_box_pack_start(GTK_BOX(content), speedLabel, false, false, 2);
+
+        if (single) {
+            gtk_widget_hide(progressLabel2);
+            gtk_widget_hide(progressBar2);
+            gtk_widget_hide(speedLabel);
+        }
+
         gtk_widget_show_all(content);
+
         g_signal_connect(progressDialog, "response",
             G_CALLBACK(+[](GtkDialog *d, int resp, gpointer) {
-                if (resp == GTK_RESPONSE_CANCEL) shouldStop = true;
+                if (resp == GTK_RESPONSE_CANCEL) {
+                    shouldStop = true;
+                    pid_t pid = gh_pid.exchange(0);
+                    if (pid > 0) {
+                        kill(pid, SIGTERM);
+                        this_thread::sleep_for(chrono::milliseconds(200));
+                        kill(pid, SIGKILL);
+                        set_status("Cancelled");
+                    }
+                }
             }), nullptr);
     } else {
         gtk_window_set_title(GTK_WINDOW(progressDialog), safe(title).c_str());
+        if (single) {
+            gtk_widget_hide(progressLabel2);
+            gtk_widget_hide(progressBar2);
+            gtk_widget_hide(speedLabel);
+        } else {
+            gtk_widget_show(progressLabel2);
+            gtk_widget_show(progressBar2);
+            gtk_widget_show(speedLabel);
+        }
     }
-    show_progress("Starting...", 0.0);
+
+    if (single) {
+        show_single_progress("Starting...", 0.0);
+    } else {
+        show_double_progress("Files: 0/0", 0.0, "Size: 0 B / 0 B", 0.0);
+        gtk_label_set_text(GTK_LABEL(speedLabel), "Calculating...");
+    }
     gtk_widget_show(progressDialog);
 }
 
@@ -173,6 +354,11 @@ void hide_progress_dialog() {
     if (progressDialog) {
         gtk_widget_hide(progressDialog);
         shouldStop = false;
+        downloaded_bytes = 0;
+        downloaded_files = 0;
+        gh_pid = 0;
+        current_speed = 0.0;
+        current_eta = 0.0;
     }
 }
 
@@ -398,14 +584,26 @@ void fetch_release_details(const string& owner, const string& repo, const string
     }
 
     json_object* assets;
+    release.total_size_bytes = 0;
     if (json_object_object_get_ex(root, "assets", &assets)) {
         int len = json_object_array_length(assets);
         for (int i = 0; i < len && !shouldStop; i++) {
             json_object* a = json_object_array_get_idx(assets, i);
             json_object* nameObj;
+            json_object* sizeObj;
+            Asset asset;
             if (json_object_object_get_ex(a, "name", &nameObj)) {
                 const char* v = json_object_get_string(nameObj);
-                if (v) release.assets.push_back({safe(v)});
+                asset.name = v ? safe(v) : "";
+            }
+            if (json_object_object_get_ex(a, "size", &sizeObj)) {
+                int64_t size_bytes = json_object_get_int64(sizeObj);
+                asset.size_bytes = size_bytes;
+                asset.size = format_size(size_bytes);
+                release.total_size_bytes += size_bytes;
+            }
+            if (!asset.name.empty()) {
+                release.assets.push_back(asset);
             }
         }
     }
@@ -432,6 +630,7 @@ vector<Release> getReleases(const string& owner, const string& repo, function<vo
     for (int i = 0; i < len && !shouldStop; i++) {
         json_object* item = json_object_array_get_idx(root, i);
         Release r;
+        r.total_size_bytes = 0;
         json_object* obj;
         if (json_object_object_get_ex(item, "tagName", &obj)) {
             const char* v = json_object_get_string(obj);
@@ -475,18 +674,246 @@ vector<Release> getReleases(const string& owner, const string& repo, function<vo
     return result;
 }
 
+// ============ File Utilities ============
+
+bool file_exists(const string& path) {
+    struct stat st;
+    return stat(path.c_str(), &st) == 0;
+}
+
+int64_t file_size(const string& path) {
+    struct stat st;
+    if (stat(path.c_str(), &st) == 0) {
+        return st.st_size;
+    }
+    return -1;
+}
+
+// ============ Download with Speed/ETA Monitoring ============
+
+void do_download_async(const string& owner, const string& repo, const string& tag,
+                       const vector<Asset>& assets, bool create_folder, const string& base_path) {
+    if (isWorking) return;
+
+    downloaded_bytes = 0;
+    downloaded_files = 0;
+    shouldStop = false;
+    gh_pid = 0;
+    current_speed = 0.0;
+    current_eta = 0.0;
+
+    isWorking = true;
+    gtk_spinner_start(GTK_SPINNER(spinner));
+    gtk_widget_show(spinner);
+    gtk_widget_set_sensitive(GTK_WIDGET(window), false);
+
+    show_progress_dialog("Downloading...", false);
+
+    int total_files = assets.size();
+    int64_t total_bytes = 0;
+    for (auto& a : assets) total_bytes += a.size_bytes;
+
+    thread([owner, repo, tag, assets, total_files, total_bytes,
+            create_folder, base_path]() {
+        chdir(base_path.c_str());
+
+        string target_dir = "";
+        if (create_folder) {
+            target_dir = repo + "-" + tag;
+            mkdir(target_dir.c_str(), 0755);
+        }
+
+        chrono::steady_clock::time_point last_sample_time = chrono::steady_clock::now();
+        int64_t last_sample_bytes = 0;
+        int64_t accumulated_bytes = 0;
+
+        for (int i = 0; i < total_files && !shouldStop; i++) {
+            string filename = assets[i].name;
+            string filepath = target_dir.empty() ? filename : target_dir + "/" + filename;
+            int64_t total_size = assets[i].size_bytes;
+
+            // Skip if file already exists and has correct size
+            if (file_exists(filepath) && file_size(filepath) >= total_size) {
+                show_debug("Skipping existing: " + filename);
+                downloaded_files++;
+                downloaded_bytes += total_size;
+                accumulated_bytes += total_size;
+                double file_progress = downloaded_files / (double)total_files;
+                double byte_progress = (total_bytes > 0) ?
+                    (accumulated_bytes / (double)total_bytes) : file_progress;
+                show_double_progress(
+                    "Files: " + to_string(downloaded_files) + "/" + to_string(total_files),
+                    file_progress,
+                    "Skipped: " + filename, 1.0
+                );
+                continue;
+            }
+
+            show_debug("Downloading: " + filename);
+
+            string cmd = "gh release download -R " + owner + "/" + repo +
+                        " " + tag + " --pattern '" + filename + "' --clobber 2>/dev/null";
+            if (!target_dir.empty()) {
+                cmd = "cd '" + target_dir + "' && " + cmd;
+            }
+
+            pid_t pid = fork();
+            if (pid == 0) {
+                execl("/bin/sh", "sh", "-c", cmd.c_str(), NULL);
+                exit(1);
+            } else if (pid > 0) {
+                gh_pid = pid;
+                bool file_created = false;
+                int64_t last_size = 0;
+
+                // For speed calculation, initialize last_sample_bytes to existing file size
+                int64_t initial_size = file_exists(filepath) ? file_size(filepath) : 0;
+                if (initial_size > 0) {
+                    last_sample_bytes = initial_size;
+                }
+
+                // Monitor this file's download progress
+                while (!shouldStop) {
+                    if (file_exists(filepath)) {
+                        int64_t current_size = file_size(filepath);
+                        if (current_size >= 0) {
+                            file_created = true;
+                            double single_progress = (total_size > 0) ?
+                                min(current_size / (double)total_size, 0.999) : 0.0;
+
+                            // Calculate speed
+                            auto now = chrono::steady_clock::now();
+                            double elapsed = chrono::duration<double>(now - last_sample_time).count();
+                            if (elapsed >= 0.5) {
+                                int64_t delta_bytes = current_size - last_sample_bytes;
+                                if (delta_bytes < 0) delta_bytes = 0;
+                                double speed_kb_s = (delta_bytes / 1024.0) / elapsed;
+                                if (speed_kb_s > 0 && elapsed > 0) {
+                                    current_speed = speed_kb_s;
+                                    int64_t remaining_bytes = total_bytes - accumulated_bytes - current_size;
+                                    if (remaining_bytes < 0) remaining_bytes = 0;
+                                    if (remaining_bytes > 0 && speed_kb_s > 0.1) {
+                                        current_eta = (remaining_bytes / 1024.0) / speed_kb_s;
+                                    } else if (remaining_bytes <= 0) {
+                                        current_eta = 0.0;
+                                    }
+                                }
+                                last_sample_time = now;
+                                last_sample_bytes = current_size;
+                            }
+
+                            string label2 = filename + ": " + format_size(current_size) +
+                                           " / " + format_size(total_size);
+                            show_double_progress(
+                                "Files: " + to_string(downloaded_files) + "/" + to_string(total_files),
+                                downloaded_files / (double)total_files,
+                                label2, single_progress
+                            );
+                            last_size = current_size;
+
+                            if (current_size >= total_size) {
+                                break;
+                            }
+                        }
+                    } else {
+                        if (file_created) {
+                            show_double_progress(
+                                "Files: " + to_string(downloaded_files) + "/" + to_string(total_files),
+                                downloaded_files / (double)total_files,
+                                "Waiting: " + filename, 0.0
+                            );
+                        }
+                    }
+
+                    // Check if gh process finished
+                    int status;
+                    pid_t result = waitpid(pid, &status, WNOHANG);
+                    if (result == pid) {
+                        if (file_exists(filepath) && file_size(filepath) >= total_size) {
+                            break;
+                        }
+                        if (file_created) {
+                            break;
+                        }
+                        show_debug("Download failed: " + filename);
+                        break;
+                    }
+
+                    this_thread::sleep_for(chrono::milliseconds(200));
+                }
+
+                waitpid(pid, NULL, 0);
+                if (gh_pid == pid) gh_pid = 0;
+            } else {
+                // fork failed
+                show_debug("Fork failed for: " + filename);
+                continue;
+            }
+
+            downloaded_files++;
+            downloaded_bytes += total_size;
+            accumulated_bytes += total_size;
+
+            double file_progress = downloaded_files / (double)total_files;
+            double byte_progress = (total_bytes > 0) ?
+                (accumulated_bytes / (double)total_bytes) : file_progress;
+            show_double_progress(
+                "Files: " + to_string(downloaded_files) + "/" + to_string(total_files),
+                file_progress,
+                "Done: " + filename, 1.0
+            );
+        }
+
+        // Final update
+        show_double_progress(
+            "Files: " + to_string(total_files) + "/" + to_string(total_files),
+            1.0,
+            "Size: " + format_size(total_bytes) + " / " + format_size(total_bytes),
+            1.0
+        );
+        gtk_label_set_text(GTK_LABEL(speedLabel), "Complete!");
+
+        show_debug("Download thread finished");
+
+        g_idle_add([](gpointer) -> gboolean {
+            if (shouldStop) {
+                set_status("Download cancelled");
+            } else {
+                set_status("Download complete!");
+            }
+            set_working(false);
+            return G_SOURCE_REMOVE;
+        }, nullptr);
+    }).detach();
+}
+
+void do_clone_async(const string& repo) {
+    if (isWorking) return;
+    set_working(true);
+    show_progress_dialog("Cloning...", true);
+    thread([repo]() {
+        show_single_progress("Cloning: " + repo, 0.5);
+        exec_cmd("gh repo clone " + repo + " 2>&1");
+        g_idle_add([](gpointer) -> gboolean {
+            set_status("Clone complete!");
+            set_working(false);
+            return G_SOURCE_REMOVE;
+        }, nullptr);
+    }).detach();
+}
+
 // ============ Async Operations ============
 
 void do_search_async(const string& query) {
     if (isWorking) return;
     set_working(true);
-    show_progress_dialog("Searching...");
+    show_progress_dialog("Searching...", true);
     gtk_list_store_clear(repoStore);
     gtk_list_store_clear(releaseStore);
     gtk_list_store_clear(assetStore);
     if (bodyWebView) webkit_web_view_load_html(WEBKIT_WEB_VIEW(bodyWebView), "", NULL);
     thread([query]() {
-        auto progress = [](double f) { show_progress("Searching...", f); };
+        auto progress = [](double f) { show_single_progress("Searching...", f); };
         repos = searchRepos(query, progress);
         g_idle_add([](gpointer) -> gboolean {
             for (auto& r : repos) {
@@ -508,12 +935,12 @@ void do_search_async(const string& query) {
 void do_releases_async(const string& owner, const string& repo) {
     if (isWorking) return;
     set_working(true);
-    show_progress_dialog("Loading releases...");
+    show_progress_dialog("Loading releases...", true);
     gtk_list_store_clear(releaseStore);
     gtk_list_store_clear(assetStore);
     if (bodyWebView) webkit_web_view_load_html(WEBKIT_WEB_VIEW(bodyWebView), "", NULL);
     thread([owner, repo]() {
-        auto progress = [](double f) { show_progress("Loading releases...", f); };
+        auto progress = [](double f) { show_single_progress("Loading releases...", f); };
         releases = getReleases(owner, repo, progress);
         g_idle_add([](gpointer) -> gboolean {
             for (auto& r : releases) {
@@ -521,44 +948,12 @@ void do_releases_async(const string& owner, const string& repo) {
                 gtk_list_store_append(releaseStore, &it);
                 string assets = to_string(r.assets.size()) + " files";
                 string date = r.published.substr(0, 10);
+                string size = format_size(r.total_size_bytes);
                 gtk_list_store_set(releaseStore, &it, 0, r.tag.c_str(), 1, date.c_str(), 2, assets.c_str(), -1);
             }
             set_status("Loaded " + to_string(releases.size()) + " releases");
             set_working(false);
             gtk_notebook_set_current_page(GTK_NOTEBOOK(notebook), 1);
-            return G_SOURCE_REMOVE;
-        }, nullptr);
-    }).detach();
-}
-
-void do_download_async(const string& owner, const string& repo, const string& tag, const vector<string>& files) {
-    if (isWorking) return;
-    set_working(true);
-    show_progress_dialog("Downloading...");
-    thread([owner, repo, tag, files]() {
-        int total = files.size();
-        for (int i = 0; i < total && !shouldStop; i++) {
-            show_progress("Downloading: " + files[i], (i + 1) / (double)total);
-            exec_cmd("gh release download -R " + owner + "/" + repo + " " + tag + " --pattern '" + files[i] + "' --clobber 2>/dev/null");
-        }
-        g_idle_add([](gpointer) -> gboolean {
-            set_status("Download complete!");
-            set_working(false);
-            return G_SOURCE_REMOVE;
-        }, nullptr);
-    }).detach();
-}
-
-void do_clone_async(const string& repo) {
-    if (isWorking) return;
-    set_working(true);
-    show_progress_dialog("Cloning...");
-    thread([repo]() {
-        show_progress("Cloning: " + repo, 0.5);
-        exec_cmd("gh repo clone " + repo + " 2>&1");
-        g_idle_add([](gpointer) -> gboolean {
-            set_status("Clone complete!");
-            set_working(false);
             return G_SOURCE_REMOVE;
         }, nullptr);
     }).detach();
@@ -608,7 +1003,8 @@ void on_release_select(GtkTreeSelection* sel, gpointer) {
     for (auto& a : releases[idx].assets) {
         GtkTreeIter it2;
         gtk_list_store_append(assetStore, &it2);
-        gtk_list_store_set(assetStore, &it2, 0, a.name.c_str(), -1);
+        string display = a.name + "  (" + a.size + ")";
+        gtk_list_store_set(assetStore, &it2, 0, display.c_str(), -1);
     }
 
     render_markdown(releases[idx].body);
@@ -616,6 +1012,7 @@ void on_release_select(GtkTreeSelection* sel, gpointer) {
 
 void on_download(GtkWidget*, gpointer) {
     if (isWorking) return;
+
     GtkTreeSelection* sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(releaseList));
     GtkTreeIter it;
     GtkTreeModel* model;
@@ -629,34 +1026,68 @@ void on_download(GtkWidget*, gpointer) {
     g_free(tag);
     if (tagStr.empty()) return;
 
-    vector<string> files;
+    vector<Asset> selected_assets;
     GtkTreeSelection* asel = gtk_tree_view_get_selection(GTK_TREE_VIEW(assetList));
     GtkTreeIter ait;
     GtkTreeModel* amodel;
+
+    bool create_folder = true;
+
     if (gtk_tree_selection_get_selected(asel, &amodel, &ait)) {
-        char* fname;
-        gtk_tree_model_get(amodel, &ait, 0, &fname, -1);
-        if (fname) { files.push_back(fname); g_free(fname); }
+        char* display;
+        gtk_tree_model_get(amodel, &ait, 0, &display, -1);
+        if (display) {
+            string disp = display;
+            g_free(display);
+            size_t paren = disp.find("  (");
+            string name = (paren != string::npos) ? disp.substr(0, paren) : disp;
+            int idx = -1;
+            for (int i = 0; i < (int)releases.size(); i++) {
+                if (releases[i].tag == tagStr) { idx = i; break; }
+            }
+            if (idx >= 0) {
+                for (auto& a : releases[idx].assets) {
+                    if (a.name == name) {
+                        selected_assets.push_back(a);
+                        break;
+                    }
+                }
+            }
+            create_folder = false;
+        }
     } else {
         int idx = -1;
         for (int i = 0; i < (int)releases.size(); i++) {
             if (releases[i].tag == tagStr) { idx = i; break; }
         }
         if (idx >= 0) {
-            for (auto& a : releases[idx].assets) files.push_back(a.name);
+            selected_assets = releases[idx].assets;
         }
+        create_folder = true;
     }
-    if (files.empty()) { set_status("No assets"); return; }
 
-    GtkWidget* fc = gtk_file_chooser_dialog_new("Select directory", GTK_WINDOW(window),
+    if (selected_assets.empty()) {
+        set_status("No assets to download");
+        return;
+    }
+
+    GtkWidget* fc = gtk_file_chooser_dialog_new("Select download directory", GTK_WINDOW(window),
         GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER, "_Cancel", GTK_RESPONSE_CANCEL,
         "_Select", GTK_RESPONSE_ACCEPT, NULL);
-    if (gtk_dialog_run(GTK_DIALOG(fc)) == GTK_RESPONSE_ACCEPT) {
+    gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(fc), ".");
+
+    int response = gtk_dialog_run(GTK_DIALOG(fc));
+    if (response == GTK_RESPONSE_ACCEPT) {
         char* path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(fc));
-        if (path) { chdir(path); g_free(path); }
-        do_download_async(currentOwner, currentRepo, tagStr, files);
+        gtk_widget_destroy(fc);
+        if (path) {
+            string download_path = string(path);
+            g_free(path);
+            do_download_async(currentOwner, currentRepo, tagStr, selected_assets, create_folder, download_path);
+        }
+    } else {
+        gtk_widget_destroy(fc);
     }
-    gtk_widget_destroy(fc);
 }
 
 void on_clone(GtkWidget*, gpointer) {
@@ -772,7 +1203,6 @@ int main(int argc, char* argv[]) {
     gtk_widget_set_size_request(hpaned, -1, 500);
     gtk_box_pack_start(GTK_BOX(releasePage), hpaned, true, true, 0);
 
-    // Left: Releases
     GtkWidget* leftBox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
     GtkWidget* scrollR = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrollR), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
@@ -794,7 +1224,6 @@ int main(int argc, char* argv[]) {
     gtk_container_add(GTK_CONTAINER(scrollR), releaseList);
     gtk_paned_pack1(GTK_PANED(hpaned), leftBox, true, false);
 
-    // Right: Assets + Body
     GtkWidget* rightBox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
 
     GtkWidget* assetFrame = gtk_frame_new("Assets");
@@ -852,7 +1281,10 @@ int main(int argc, char* argv[]) {
 
     progressDialog = nullptr;
     progressBar = nullptr;
+    progressBar2 = nullptr;
     progressLabel = nullptr;
+    progressLabel2 = nullptr;
+    speedLabel = nullptr;
 
     gtk_widget_show_all(window);
     gtk_main();
