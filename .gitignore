@@ -1,0 +1,24 @@
+# Compiled binaries
+ghgtk
+*.o
+*.a
+*.so
+
+# Build directories
+build/
+bin/
+obj/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug
+core.*
+*.log
