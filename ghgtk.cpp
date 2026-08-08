@@ -76,6 +76,7 @@ struct Repo {
 vector<Repo> repos;
 vector<Release> releases;
 string currentOwner, currentRepo;
+string current_readme_base_url;
 atomic<bool> isWorking{false};
 atomic<bool> shouldStop{false};
 atomic<int64_t> downloaded_bytes{0};
@@ -778,6 +779,8 @@ string fetch_readme(const string& owner, const string& repo) {
     if (!root) return "";
 
     string content = "";
+    string html_url = "";
+    
     json_object* contentObj;
     if (json_object_object_get_ex(root, "content", &contentObj)) {
         const char* v = json_object_get_string(contentObj);
@@ -793,6 +796,23 @@ string fetch_readme(const string& owner, const string& repo) {
             }
         }
     }
+    
+    // 获取 README 的 HTML URL，用于解析相对路径
+    json_object* htmlUrlObj;
+    if (json_object_object_get_ex(root, "html_url", &htmlUrlObj)) {
+        const char* v = json_object_get_string(htmlUrlObj);
+        if (v) {
+            html_url = safe(v);
+            // 去掉文件名，只保留目录
+            size_t last_slash = html_url.find_last_of('/');
+            if (last_slash != string::npos) {
+                current_readme_base_url = html_url.substr(0, last_slash + 1);
+            } else {
+                current_readme_base_url = html_url;
+            }
+        }
+    }
+    
     json_object_put(root);
     return content;
 }
@@ -1235,7 +1255,23 @@ void do_releases_async(const string& owner, const string& repo) {
 void on_search(GtkWidget*, gpointer) {
     const char* q = gtk_entry_get_text(GTK_ENTRY(searchEntry));
     if (strlen(q) == 0) { set_status("Enter search term"); return; }
-    do_search_async(q);
+    
+    string query = string(q);
+    
+    // 检测是否是 URL 跳转指令: url:http... 或 url:https...
+    if (query.find("url:") == 0 && query.length() > 4) {
+        string url = query.substr(4);
+        // 如果 url 没有协议前缀，添加 https://
+        if (url.find("http") != 0) {
+            url = "https://" + url;
+        }
+        set_status("Loading: " + url);
+        webkit_web_view_load_uri(WEBKIT_WEB_VIEW(readmeWebView), url.c_str());
+        return;
+    }
+    
+    // 普通搜索
+    do_search_async(query);
 }
 
 // ============ Callback: README load (g_idle_add compatible) ============
@@ -1250,6 +1286,144 @@ static gboolean on_readme_load(gpointer data) {
     }
     delete readme;
     return G_SOURCE_REMOVE;
+}
+
+// ============ 添加 URL 拦截和相对路径补全 ============
+
+// ============ 修复相对路径：直接加载 raw 内容 ============
+
+// ============ 修复 URL 拦截和相对路径补全 ============
+
+static gboolean on_readme_navigation_policy_decision(WebKitWebView *web_view,
+                                                      WebKitNavigationPolicyDecision *decision,
+                                                      gpointer user_data) {
+    WebKitNavigationAction *action = webkit_navigation_policy_decision_get_navigation_action(decision);
+    WebKitURIRequest *request = webkit_navigation_action_get_request(action);
+    const char* uri = webkit_uri_request_get_uri(request);
+    string uri_str = uri ? string(uri) : "";
+    
+    WebKitPolicyDecision *policy_decision = WEBKIT_POLICY_DECISION(decision);
+    
+    if (uri_str.empty() || uri_str.find("about:") == 0 || uri_str.find("data:") == 0) {
+        webkit_policy_decision_use(policy_decision);
+        return TRUE;
+    }
+    
+    // 检测相对路径
+    if (uri_str.find("://") == string::npos && uri_str.find("about:") != 0) {
+        if (!current_readme_base_url.empty()) {
+            // 从 current_readme_base_url 提取 owner 和 repo
+            string base = current_readme_base_url;
+            string owner, repo;
+            
+            size_t start = base.find("github.com/");
+            if (start != string::npos) {
+                start += 11;
+                size_t end = base.find("/", start);
+                if (end != string::npos) {
+                    owner = base.substr(start, end - start);
+                    size_t start2 = end + 1;
+                    size_t end2 = base.find("/", start2);
+                    if (end2 != string::npos) {
+                        repo = base.substr(start2, end2 - start2);
+                    }
+                }
+            }
+            
+            if (!owner.empty() && !repo.empty()) {
+                string rel_path = uri_str;
+                if (rel_path.find("./") == 0) rel_path = rel_path.substr(2);
+                while (rel_path.find("../") == 0) {
+                    rel_path = rel_path.substr(3);
+                }
+                
+                bool is_md = (rel_path.length() >= 3 && rel_path.substr(rel_path.length() - 3) == ".md");
+                bool is_dir = (!rel_path.empty() && rel_path.back() == '/');
+                
+                if (is_md) {
+                    string cmd = "gh api repos/" + owner + "/" + repo + "/contents/" + rel_path + " 2>&1";
+                    string output = exec_cmd(cmd);
+                    
+                    json_object* root = json_tokener_parse(output.c_str());
+                    if (root) {
+                        json_object* contentObj;
+                        string content;
+                        if (json_object_object_get_ex(root, "content", &contentObj)) {
+                            const char* v = json_object_get_string(contentObj);
+                            if (v) {
+                                string encoded = v;
+                                encoded.erase(remove(encoded.begin(), encoded.end(), '\n'), encoded.end());
+                                encoded.erase(remove(encoded.begin(), encoded.end(), '\r'), encoded.end());
+                                string cmd2 = "echo '" + encoded + "' | base64 -d 2>/dev/null";
+                                content = exec_cmd(cmd2);
+                            }
+                        }
+                        json_object_put(root);
+                        
+                        if (!content.empty()) {
+                            set_status("→ Loading: " + rel_path);
+                            render_markdown_to_webview(GTK_WIDGET(web_view), content, "");
+                            webkit_policy_decision_ignore(policy_decision);
+                            return TRUE;
+                        }
+                    }
+                } else if (is_dir) {
+                    string cmd = "gh api repos/" + owner + "/" + repo + "/contents/" + rel_path + " 2>&1";
+                    string output = exec_cmd(cmd);
+                    
+                    json_object* root = json_tokener_parse(output.c_str());
+                    if (root && json_object_get_type(root) == json_type_array) {
+                        string html = "<h2>Directory: " + rel_path + "</h2><ul>";
+                        int len = json_object_array_length(root);
+                        for (int i = 0; i < len && i < 50; i++) {
+                            json_object* item = json_object_array_get_idx(root, i);
+                            json_object* nameObj;
+                            json_object* typeObj;
+                            string name, type;
+                            if (json_object_object_get_ex(item, "name", &nameObj)) {
+                                const char* n = json_object_get_string(nameObj);
+                                if (n) name = n;
+                            }
+                            if (json_object_object_get_ex(item, "type", &typeObj)) {
+                                const char* t = json_object_get_string(typeObj);
+                                if (t) type = t;
+                            }
+                            if (!name.empty()) {
+                                string icon = (type == "dir") ? "📁 " : "📄 ";
+                                html += "<li>" + icon + "<a href=\"" + name + "\">" + name + "</a></li>";
+                            }
+                        }
+                        html += "</ul>";
+                        if (len >= 50) html += "<p>... and more</p>";
+                        
+                        set_status("→ Directory: " + rel_path);
+                        string full_html = 
+                            "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><style>"
+                            "body { font-family: monospace; margin: 15px; }"
+                            "a { color: #0366d6; text-decoration: none; }"
+                            "a:hover { text-decoration: underline; }"
+                            "li { margin: 4px 0; }"
+                            "</style></head><body>" + html + "</body></html>";
+                        webkit_web_view_load_html(web_view, full_html.c_str(), NULL);
+                        webkit_policy_decision_ignore(policy_decision);
+                        json_object_put(root);
+                        return TRUE;
+                    }
+                    if (root) json_object_put(root);
+                } else {
+                    string raw_url = "https://raw.githubusercontent.com/" + owner + "/" + repo + "/main/" + rel_path;
+                    set_status("→ Loading raw: " + rel_path);
+                    webkit_web_view_load_uri(web_view, raw_url.c_str());
+                    webkit_policy_decision_ignore(policy_decision);
+                    return TRUE;
+                }
+            }
+        }
+    }
+    
+    set_status("→ " + uri_str);
+    webkit_policy_decision_use(policy_decision);
+    return TRUE;
 }
 
 // ============ Callback: repo selected in search ============
@@ -1269,6 +1443,9 @@ void on_repo_selected_in_search(GtkTreeSelection* selection, gpointer data) {
 
     string owner = full.substr(0, slash);
     string repo = full.substr(slash + 1);
+    
+    // 重置 base URL
+    current_readme_base_url = "https://github.com/" + owner + "/" + repo + "/blob/main/";
 
     thread([owner, repo]() {
         string readme = fetch_readme(owner, repo);
@@ -1513,6 +1690,8 @@ int main(int argc, char* argv[]) {
     gtk_box_pack_start(GTK_BOX(readmeBox), readmeScroll, true, true, 0);
     readmeWebView = webkit_web_view_new();
     g_signal_connect(readmeWebView, "mouse-target-changed", G_CALLBACK(on_mouse_target_changed), NULL);
+    g_signal_connect(readmeWebView, "navigation-policy-decision-requested",
+                 G_CALLBACK(on_readme_navigation_policy_decision), NULL);
     webkit_web_view_load_html(WEBKIT_WEB_VIEW(readmeWebView),
         "<p style='font-family: monospace; margin: 15px; color: #666;'>Select a repository to preview README</p>", NULL);
     gtk_container_add(GTK_CONTAINER(readmeScroll), readmeWebView);
