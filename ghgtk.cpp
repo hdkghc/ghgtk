@@ -86,6 +86,7 @@ atomic<double> current_speed{0.0};
 atomic<double> current_eta{0.0};
 mutex releasesMutex;
 mutex speed_mutex;
+static bool is_dark_theme = false;
 
 GtkWidget *window;
 GtkWidget *searchEntry;
@@ -109,6 +110,80 @@ GtkListStore *repoStore;
 GtkListStore *releaseStore;
 GtkListStore *assetStore;
 GtkTextBuffer *debugBuffer = nullptr;
+
+
+static void detect_theme() {
+    GtkSettings* settings = gtk_settings_get_default();
+    gchar* theme_name = NULL;
+    g_object_get(settings, "gtk-theme-name", &theme_name, NULL);
+    if (theme_name) {
+        string theme = string(theme_name);
+        // 检测是否包含 "dark" 或 "Dark"
+        for (auto& c : theme) c = tolower(c);
+        is_dark_theme = (theme.find("dark") != string::npos);
+        g_free(theme_name);
+    }
+}
+
+static string get_initial_html(const string& text, bool dark) {
+    string color = dark ? "#8b949e" : "#666";
+    string bg = dark ? "#0d1117" : "#ffffff";
+    return "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><style>"
+           "body { background: " + bg + "; color: " + color + "; font-family: monospace; margin: 15px; }"
+           "</style></head><body><p>" + text + "</p></body></html>";
+}
+
+static string get_markdown_css(bool dark) {
+    if (dark) {
+        return
+            "body { font-family: 'Ubuntu Sans Mono', 'Cascadia Mono', 'Consolas', monospace; font-size: 14px; line-height: 1.6; margin: 15px; padding: 0; color: #e6edf3; background: #0d1117; overflow-wrap: break-word; }\n"
+            "h1 { font-size: 2em; border-bottom: 2px solid #21262d; padding-bottom: 0.3em; }\n"
+            "h2 { font-size: 1.5em; border-bottom: 1px solid #21262d; padding-bottom: 0.3em; }\n"
+            "h3 { font-size: 1.25em; }\n"
+            "h4 { font-size: 1.1em; }\n"
+            "h5 { font-size: 1.0em; }\n"
+            "h6 { font-size: 0.9em; }\n"
+            "p { margin: 0.5em 0; }\n"
+            "pre { background: #161b22; padding: 12px; border-radius: 6px; overflow: auto; border: 1px solid #30363d; font-family: 'Cascadia Mono', 'Ubuntu Sans Mono', monospace; font-size: 13px; white-space: pre-wrap; word-break: break-all; }\n"
+            "code { background: #161b22; padding: 2px 6px; border-radius: 3px; font-family: 'Cascadia Mono', 'Ubuntu Sans Mono', monospace; font-size: 0.9em; color: #e6edf3; }\n"
+            "pre code { background: transparent; padding: 0; border-radius: 0; font-size: inherit; }\n"
+            "ul, ol { padding-left: 25px; margin: 0.3em 0; }\n"
+            "li { margin: 2px 0; }\n"
+            "li > ul, li > ol { margin: 0; padding-left: 20px; }\n"
+            "blockquote { border-left: 4px solid #30363d; padding-left: 16px; color: #8b949e; margin: 10px 0; background: #161b22; padding: 8px 16px; }\n"
+            "a { color: #58a6ff; text-decoration: underline; cursor: pointer; }\n"
+            "a:hover { color: #79c0ff; }\n"
+            "img { max-width: 100%; }\n"
+            "table { border-collapse: collapse; width: 100%; margin: 10px 0; }\n"
+            "th, td { border: 1px solid #30363d; padding: 6px 13px; }\n"
+            "th { background: #161b22; }\n"
+            "hr { border: 0; border-top: 1px solid #21262d; margin: 15px 0; }\n";
+    } else {
+        return
+            "body { font-family: 'Ubuntu Sans Mono', 'Cascadia Mono', 'Consolas', monospace; font-size: 14px; line-height: 1.6; margin: 15px; padding: 0; color: #24292e; background: #ffffff; overflow-wrap: break-word; }\n"
+            "h1 { font-size: 2em; border-bottom: 2px solid #eaecef; padding-bottom: 0.3em; }\n"
+            "h2 { font-size: 1.5em; border-bottom: 1px solid #eaecef; padding-bottom: 0.3em; }\n"
+            "h3 { font-size: 1.25em; }\n"
+            "h4 { font-size: 1.1em; }\n"
+            "h5 { font-size: 1.0em; }\n"
+            "h6 { font-size: 0.9em; }\n"
+            "p { margin: 0.5em 0; }\n"
+            "pre { background: #f6f8fa; padding: 12px; border-radius: 6px; overflow: auto; border: 1px solid #e1e4e8; font-family: 'Cascadia Mono', 'Ubuntu Sans Mono', monospace; font-size: 13px; white-space: pre-wrap; word-break: break-all; }\n"
+            "code { background: #f6f8fa; padding: 2px 6px; border-radius: 3px; font-family: 'Cascadia Mono', 'Ubuntu Sans Mono', monospace; font-size: 0.9em; }\n"
+            "pre code { background: transparent; padding: 0; border-radius: 0; font-size: inherit; }\n"
+            "ul, ol { padding-left: 25px; margin: 0.3em 0; }\n"
+            "li { margin: 2px 0; }\n"
+            "li > ul, li > ol { margin: 0; padding-left: 20px; }\n"
+            "blockquote { border-left: 4px solid #dfe2e5; padding-left: 16px; color: #6a737d; margin: 10px 0; background: #f8f9fa; padding: 8px 16px; }\n"
+            "a { color: #0366d6; text-decoration: underline; cursor: pointer; }\n"
+            "a:hover { color: #0056b3; }\n"
+            "img { max-width: 100%; }\n"
+            "table { border-collapse: collapse; width: 100%; margin: 10px 0; }\n"
+            "th, td { border: 1px solid #dfe2e5; padding: 6px 13px; }\n"
+            "th { background: #f6f8fa; }\n"
+            "hr { border: 0; border-top: 1px solid #eaecef; margin: 15px 0; }\n";
+    }
+}
 
 // ============ Safe String - 严格 UTF-8 验证 ============
 
@@ -715,33 +790,13 @@ void render_markdown_to_webview(GtkWidget* webView, const string& body, const st
     if (!webView) return;
 
     string html_content = render_markdown_html(body);
+    string css = get_markdown_css(is_dark_theme);
 
     string full_html =
         "<!DOCTYPE html>\n"
         "<html>\n"
-        "<head><meta charset=\"UTF-8\"><style>\n"
-        "body { font-family: 'Ubuntu Sans Mono', 'Cascadia Mono', 'Consolas', monospace; font-size: 14px; line-height: 1.6; margin: 15px; padding: 0; color: #24292e; background: #ffffff; overflow-wrap: break-word; }\n"
-        "h1 { font-size: 2em; border-bottom: 2px solid #eaecef; padding-bottom: 0.3em; }\n"
-        "h2 { font-size: 1.5em; border-bottom: 1px solid #eaecef; padding-bottom: 0.3em; }\n"
-        "h3 { font-size: 1.25em; }\n"
-        "h4 { font-size: 1.1em; }\n"
-        "h5 { font-size: 1.0em; }\n"
-        "h6 { font-size: 0.9em; }\n"
-        "p { margin: 0.5em 0; }\n"
-        "pre { background: #f6f8fa; padding: 12px; border-radius: 6px; overflow: auto; border: 1px solid #e1e4e8; font-family: 'Cascadia Mono', 'Ubuntu Sans Mono', monospace; font-size: 13px; white-space: pre-wrap; word-break: break-all; }\n"
-        "code { background: #f6f8fa; padding: 2px 6px; border-radius: 3px; font-family: 'Cascadia Mono', 'Ubuntu Sans Mono', monospace; font-size: 0.9em; }\n"
-        "pre code { background: transparent; padding: 0; border-radius: 0; font-size: inherit; }\n"
-        "ul, ol { padding-left: 25px; margin: 0.3em 0; }\n"
-        "li { margin: 2px 0; }\n"
-        "li > ul, li > ol { margin: 0; padding-left: 20px; }\n"
-        "blockquote { border-left: 4px solid #dfe2e5; padding-left: 16px; color: #6a737d; margin: 10px 0; background: #f8f9fa; padding: 8px 16px; }\n"
-        "a { color: #0366d6; text-decoration: underline; cursor: pointer; }\n"
-        "a:hover { color: #0056b3; }\n"
-        "img { max-width: 100%; }\n"
-        "table { border-collapse: collapse; width: 100%; margin: 10px 0; }\n"
-        "th, td { border: 1px solid #dfe2e5; padding: 6px 13px; }\n"
-        "th { background: #f6f8fa; }\n"
-        "hr { border: 0; border-top: 1px solid #eaecef; margin: 15px 0; }\n"
+        "<head><meta charset=\"UTF-8\"><style>\n" +
+        css +
         "</style></head>\n"
         "<body>" + html_content + "</body>\n"
         "</html>";
@@ -1229,7 +1284,11 @@ void do_releases_async(const string& owner, const string& repo) {
     show_progress_dialog("Loading releases...", true);
     gtk_list_store_clear(releaseStore);
     gtk_list_store_clear(assetStore);
-    if (bodyWebView) webkit_web_view_load_html(WEBKIT_WEB_VIEW(bodyWebView), "", NULL);
+    if (bodyWebView) {
+        // 先清空，显示初始提示
+        string html = get_initial_html("Select a release to see notes", is_dark_theme);
+        webkit_web_view_load_html(WEBKIT_WEB_VIEW(bodyWebView), html.c_str(), NULL);
+    }
     thread([owner, repo]() {
         auto progress = [](double f) { show_single_progress("Loading releases...", f); };
         releases = getReleases(owner, repo, progress);
@@ -1245,6 +1304,13 @@ void do_releases_async(const string& owner, const string& repo) {
             set_status("Loaded " + to_string(releases.size()) + " releases");
             set_working(false);
             gtk_notebook_set_current_page(GTK_NOTEBOOK(notebook), 1);
+
+            // 加载完成后，取消所有选中，触发 on_release_select 显示初始页面
+            GtkTreeSelection* sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(releaseList));
+            gtk_tree_selection_unselect_all(sel);
+            // 手动触发 changed 信号，让 on_release_select 渲染初始页面
+            g_signal_emit_by_name(sel, "changed", 0);
+
             return G_SOURCE_REMOVE;
         }, nullptr);
     }).detach();
@@ -1281,8 +1347,10 @@ static gboolean on_readme_load(gpointer data) {
     if (!readme->empty()) {
         render_markdown_to_webview(readmeWebView, *readme, "");
     } else {
-        webkit_web_view_load_html(WEBKIT_WEB_VIEW(readmeWebView),
-            "<p style='font-family: monospace; margin: 15px; color: #666;'>No README found</p>", NULL);
+        string msg = is_dark_theme ?
+            "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><style>body { background: #0d1117; color: #8b949e; font-family: monospace; margin: 15px; }</style></head><body><p>No README found</p></body></html>" :
+            "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><style>body { background: #ffffff; color: #666; font-family: monospace; margin: 15px; }</style></head><body><p>No README found</p></body></html>";
+        webkit_web_view_load_html(WEBKIT_WEB_VIEW(readmeWebView), msg.c_str(), NULL);
     }
     delete readme;
     return G_SOURCE_REMOVE;
@@ -1474,7 +1542,11 @@ void on_repo_activate(GtkTreeView* view, GtkTreePath* path, GtkTreeViewColumn*, 
 void on_release_select(GtkTreeSelection* sel, gpointer) {
     GtkTreeIter it;
     GtkTreeModel* model;
-    if (!gtk_tree_selection_get_selected(sel, &model, &it)) return;
+    if (!gtk_tree_selection_get_selected(sel, &model, &it)) {
+        string html = get_initial_html("Select a release to see notes", is_dark_theme);
+        webkit_web_view_load_html(WEBKIT_WEB_VIEW(bodyWebView), html.c_str(), NULL);
+        return;
+    }
     char* tag;
     gtk_tree_model_get(model, &it, 0, &tag, -1);
     if (!tag) return;
@@ -1484,7 +1556,11 @@ void on_release_select(GtkTreeSelection* sel, gpointer) {
     for (int i = 0; i < (int)releases.size(); i++) {
         if (releases[i].tag == tagStr) { idx = i; break; }
     }
-    if (idx < 0) return;
+    if (idx < 0) {
+        string html = get_initial_html("Select a release to see notes", is_dark_theme);
+        webkit_web_view_load_html(WEBKIT_WEB_VIEW(bodyWebView), html.c_str(), NULL);
+        return;
+    }
 
     gtk_list_store_clear(assetStore);
     for (auto& a : releases[idx].assets) {
@@ -1621,6 +1697,8 @@ int main(int argc, char* argv[]) {
     gtk_window_set_default_size(GTK_WINDOW(window), 1200, 800);
     g_signal_connect(window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
 
+    detect_theme();
+
     GtkWidget* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
     gtk_container_add(GTK_CONTAINER(window), vbox);
 
@@ -1692,8 +1770,10 @@ int main(int argc, char* argv[]) {
     g_signal_connect(readmeWebView, "mouse-target-changed", G_CALLBACK(on_mouse_target_changed), NULL);
     g_signal_connect(readmeWebView, "navigation-policy-decision-requested",
                  G_CALLBACK(on_readme_navigation_policy_decision), NULL);
-    webkit_web_view_load_html(WEBKIT_WEB_VIEW(readmeWebView),
-        "<p style='font-family: monospace; margin: 15px; color: #666;'>Select a repository to preview README</p>", NULL);
+    string initial_html = is_dark_theme ?
+        "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><style>body { background: #0d1117; color: #8b949e; font-family: monospace; margin: 15px; }</style></head><body><p>Select a repository to preview README</p></body></html>" :
+        "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><style>body { background: #ffffff; color: #666; font-family: monospace; margin: 15px; }</style></head><body><p>Select a repository to preview README</p></body></html>";
+    webkit_web_view_load_html(WEBKIT_WEB_VIEW(readmeWebView), initial_html.c_str(), NULL);
     gtk_container_add(GTK_CONTAINER(readmeScroll), readmeWebView);
     gtk_paned_pack2(GTK_PANED(searchPaned), searchRightBox, true, false);
 
@@ -1769,10 +1849,14 @@ int main(int argc, char* argv[]) {
     GtkWidget* scrollB = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrollB), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
     gtk_box_pack_start(GTK_BOX(bodyBox), scrollB, true, true, 0);
+
     bodyWebView = webkit_web_view_new();
     g_signal_connect(bodyWebView, "mouse-target-changed", G_CALLBACK(on_mouse_target_changed), NULL);
-    webkit_web_view_load_html(WEBKIT_WEB_VIEW(bodyWebView),
-        "<p style='font-family: monospace; margin: 15px; color: #666;'>Select a release to see notes</p>", NULL);
+
+    string body_initial = is_dark_theme ?
+        "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><style>body { background: #0d1117; color: #8b949e; font-family: monospace; margin: 15px; }</style></head><body><p>Select a release to see notes</p></body></html>" :
+        "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><style>body { background: #ffffff; color: #666; font-family: monospace; margin: 15px; }</style></head><body><p>Select a release to see notes</p></body></html>";
+    webkit_web_view_load_html(WEBKIT_WEB_VIEW(bodyWebView), body_initial.c_str(), NULL);
     gtk_container_add(GTK_CONTAINER(scrollB), bodyWebView);
 
     gtk_paned_pack2(GTK_PANED(hpaned), releaseRightBox, true, false);
